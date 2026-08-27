@@ -12,6 +12,7 @@ members = [
     "deps/policy-engine",
 ]
 resolver = "2"
+exclude = ["vendored/actix-http-3.12.1"]
 
 [workspace.package]
 version = "0.1.0"
@@ -79,4 +80,9 @@ uuid = { version = "1.23.1", features = ["v4"] }
 zeroize = "1"
 
 [patch.crates-io]
+# actix-http upstream hard-codes a 128 KiB request-head limit (MAX_BUFFER_SIZE).
+# Trustee EAR tokens with embedded NRAS device JWTs reach ~238 KB in the
+# Authorization header, so KBS rejects them with "message head is too large".
+# The vendored copy raises the limit to 2 MiB. See vendored/actix-http-3.12.1.
+actix-http = { path = "vendored/actix-http-3.12.1" }
 sev = { git = "https://github.com/virtee/sev", rev = "d487809188c3c92e397bc92e2cb2a85eb982c980" }
