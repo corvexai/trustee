@@ -212,6 +212,16 @@ so the composite backend delegates challenge generation to Intel TA and pins the
 CoCo AS side to sha512 via `coco_as_grpc.runtime_data_hash_algorithm`. Leave
 that property unset unless you have a specific reason to override it.
 
+**Token verification must match `return_token`.** The two token types are
+verified by different mechanisms and their settings are not interchangeable. A
+CoCo AS (EAR) token carries its signing key in the JWT header and is checked
+against a trusted CA, so `return_token = "coco"` requires
+`attestation_token.trusted_certs_paths` (or `insecure_key`). An Intel TA token
+is resolved by `kid`, so `return_token = "ita"` requires
+`attestation_token.trusted_jwk_sets`. Configuring only the other one leaves KBS
+unable to verify the token it just issued, and every resource request fails at
+redemption rather than at startup.
+
 See `config/kbs-config-composite.toml` for a complete example.
 
 ### Admin API Configuration

@@ -159,6 +159,23 @@ pub struct IntelTrustAuthority {
     token_verifier: JwtVerifier,
 }
 
+/// The `runtime_data` hash algorithm Intel TA requires for a given TEE.
+///
+/// This is the single source of truth for that choice. `generate_challenge`
+/// uses it to tell the guest which algorithm to bake into its evidence, and the
+/// composite backend uses it to pin the CoCo AS side to the same algorithm. If
+/// the two ever disagreed, every nonce comparison on one side would fail, so
+/// they must not be written out twice.
+///
+/// Returns `None` for TEEs Intel TA does not model.
+pub fn negotiated_hash_algorithm(tee: Tee) -> Option<HashAlgorithm> {
+    match tee {
+        Tee::Sgx | Tee::AzTdxVtpm => Some(HashAlgorithm::Sha256),
+        Tee::Tdx => Some(HashAlgorithm::Sha512),
+        _ => None,
+    }
+}
+
 /// Build the ITA attestation request from a list of independent evidences.
 ///
 /// Returns the populated request data and a URL suffix to append after [`BASE_AS_ADDR`]
@@ -404,27 +421,15 @@ impl Attest for IntelTrustAuthority {
 
         debug!("ITA: generate_challenge: supported_hash_algorithms: {supported_hash_algorithms:?}");
 
-        let hash_algorithm: String = match tee {
-            Tee::Sgx | Tee::AzTdxVtpm => {
-                let needed_algorithm = HashAlgorithm::Sha256.as_ref().to_string().to_lowercase();
-
-                if supported_hash_algorithms.contains(&needed_algorithm) {
-                    needed_algorithm
-                } else {
-                    bail!("ITA: SGX TEE does not support {needed_algorithm}");
-                }
-            }
-            Tee::Tdx => {
-                let needed_algorithm = HashAlgorithm::Sha512.as_ref().to_string().to_lowercase();
-
-                if supported_hash_algorithms.contains(&needed_algorithm) {
-                    needed_algorithm
-                } else {
-                    bail!("ITA: TDX TEE does not support {needed_algorithm}");
-                }
-            }
-            _ => bail!(ERR_INVALID_TEE),
+        let Some(needed) = negotiated_hash_algorithm(tee) else {
+            bail!(ERR_INVALID_TEE);
         };
+        let needed_algorithm = needed.as_ref().to_string().to_lowercase();
+
+        if !supported_hash_algorithms.contains(&needed_algorithm) {
+            bail!("ITA: {tee:?} TEE does not support {needed_algorithm}");
+        }
+        let hash_algorithm: String = needed_algorithm;
 
         let extra_params = json!({
             SELECTED_HASH_ALGORITHM_JSON_KEY: hash_algorithm,

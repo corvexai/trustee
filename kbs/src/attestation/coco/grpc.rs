@@ -73,9 +73,17 @@ impl Default for GrpcConfig {
     }
 }
 
+/// Chooses the `runtime_data` hash algorithm for a given TEE, returning `None`
+/// to fall through to the operator override or the default.
+///
+/// The composite backend supplies one so this client digests with exactly the
+/// algorithm the other appraiser negotiated with the guest, per TEE.
+pub type HashAlgorithmSelector = fn(Tee) -> Option<String>;
+
 pub struct GrpcClientPool {
     pool: Pool<GrpcManager>,
     runtime_data_hash_algorithm: Option<String>,
+    hash_algorithm_selector: Option<HashAlgorithmSelector>,
 }
 
 impl GrpcClientPool {
@@ -100,7 +108,32 @@ impl GrpcClientPool {
         Ok(Self {
             pool,
             runtime_data_hash_algorithm,
+            hash_algorithm_selector: None,
         })
+    }
+
+    /// Resolve the algorithm for one evidence entry: a per-TEE selector wins,
+    /// then an explicit operator override, then the historical default.
+    fn hash_algorithm_for(&self, tee: Tee) -> String {
+        if let Some(selector) = self.hash_algorithm_selector {
+            if let Some(algorithm) = selector(tee) {
+                return algorithm;
+            }
+        }
+
+        if let Some(algorithm) = &self.runtime_data_hash_algorithm {
+            return algorithm.clone();
+        }
+
+        match tee {
+            Tee::Se => HashAlgorithm::Sha512.as_ref().to_string().to_lowercase(),
+            _ => HashAlgorithm::Sha384.as_ref().to_string().to_lowercase(),
+        }
+    }
+
+    /// Install a per-TEE algorithm selector. Used by the composite backend.
+    pub fn set_hash_algorithm_selector(&mut self, selector: HashAlgorithmSelector) {
+        self.hash_algorithm_selector = Some(selector);
     }
 }
 
@@ -132,13 +165,7 @@ impl Attest for GrpcClientPool {
                 .trim_start_matches('"')
                 .to_string();
 
-            let runtime_data_hash_algorithm = match &self.runtime_data_hash_algorithm {
-                Some(algorithm) => algorithm.clone(),
-                None => match evidence.tee {
-                    Tee::Se => HashAlgorithm::Sha512.as_ref().to_string().to_lowercase(),
-                    _ => HashAlgorithm::Sha384.as_ref().to_string().to_lowercase(),
-                },
-            };
+            let runtime_data_hash_algorithm = self.hash_algorithm_for(evidence.tee);
 
             let mut request = IndividualAttestationRequest {
                 tee,

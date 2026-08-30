@@ -12,10 +12,16 @@ insecure_http = true
 [admin]
 authorization_mode = "InsecureAllowAll"
 
-# Trust the CoCo AS token signer. Add the ITA portal here as well if
-# `return_token` is set to "ita".
+# Token verification must match `return_token` below, and the two settings are
+# NOT interchangeable. A CoCo AS (EAR) token carries its signing key in the JWT
+# header and is checked against a trusted CA, so it needs `trusted_certs_paths`.
+# An Intel TA token is looked up by `kid`, so it needs `trusted_jwk_sets`.
+#
+# This file uses the default `return_token = "coco"`, so it configures the CA
+# path. If you switch to `return_token = "ita"`, add:
+#   trusted_jwk_sets = ["https://portal.trustauthority.intel.com"]
 [attestation_token]
-trusted_jwk_sets = ["https://portal.trustauthority.intel.com"]
+trusted_certs_paths = ["/opt/confidential-containers/trustee/ca-cert.pem"]
 
 [attestation_service]
 type = "composite"

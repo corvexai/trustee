@@ -39,15 +39,20 @@
 //! released. That is what makes the Intel verdict gate release rather than
 //! merely accompany it.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use kbs_types::{Challenge, Tee};
 use serde::Deserialize;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::attestation::backend::{Attest, IndependentEvidence};
 use crate::attestation::coco::grpc::{GrpcClientPool, GrpcConfig};
-use crate::attestation::intel_trust_authority::{IntelTrustAuthority, IntelTrustAuthorityConfig};
+use crate::attestation::intel_trust_authority::{
+    negotiated_hash_algorithm, IntelTrustAuthority, IntelTrustAuthorityConfig,
+};
 
 /// Which appraiser's token is handed back to the guest.
 ///
@@ -68,7 +73,7 @@ pub enum ReturnToken {
     Ita,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct CompositeConfig {
     /// The CoCo AS gRPC appraiser. Covers CPU, GPUs and NVSwitches.
     pub coco_as_grpc: GrpcConfig,
@@ -80,31 +85,63 @@ pub struct CompositeConfig {
     /// Which signed verdict is returned to the guest. Defaults to `coco`.
     #[serde(default)]
     pub return_token: ReturnToken,
+
+    /// Seconds to wait for each appraiser before giving up.
+    ///
+    /// Both appraisers are remote, and neither client sets a timeout of its
+    /// own, so without a bound here one stalled backend would block every
+    /// attestation request indefinitely. Expiry is a refusal, so it fails
+    /// closed like any other appraisal failure.
+    #[serde(default = "default_appraiser_timeout_secs")]
+    pub appraiser_timeout_secs: u64,
+}
+
+/// Generous by default: NRAS round trips for a full fabric are not fast, and a
+/// premature timeout would present as an attestation failure.
+pub const DEFAULT_APPRAISER_TIMEOUT_SECS: u64 = 180;
+
+fn default_appraiser_timeout_secs() -> u64 {
+    DEFAULT_APPRAISER_TIMEOUT_SECS
+}
+
+impl Default for CompositeConfig {
+    fn default() -> Self {
+        Self {
+            coco_as_grpc: GrpcConfig::default(),
+            intel_ta: IntelTrustAuthorityConfig::default(),
+            return_token: ReturnToken::default(),
+            appraiser_timeout_secs: DEFAULT_APPRAISER_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Pin the CoCo AS side to whatever algorithm Intel TA negotiates for this TEE.
+///
+/// Returning `None` for a TEE Intel TA does not model leaves the CoCo AS on its
+/// own default; the composite fails that handshake at Intel TA anyway.
+fn ita_hash_algorithm(tee: Tee) -> Option<String> {
+    negotiated_hash_algorithm(tee).map(|algorithm| algorithm.as_ref().to_lowercase())
 }
 
 pub struct Composite {
     coco: GrpcClientPool,
     ita: IntelTrustAuthority,
     return_token: ReturnToken,
+    appraiser_timeout: Duration,
 }
 
 impl Composite {
     pub async fn new(config: CompositeConfig) -> anyhow::Result<Self> {
-        let mut coco_config = config.coco_as_grpc;
-
-        // Pin the CoCo side to the algorithm ITA negotiates, unless the
-        // operator has already pinned one deliberately.
-        if coco_config.runtime_data_hash_algorithm.is_none() {
-            coco_config.runtime_data_hash_algorithm = Some(ITA_TDX_HASH_ALGORITHM.to_string());
-            info!(
-                "composite: pinning CoCo AS runtime data hash algorithm to \
-                 {ITA_TDX_HASH_ALGORITHM} to match the algorithm Intel TA negotiates for TDX"
-            );
-        }
-
-        let coco = GrpcClientPool::new(coco_config)
+        let mut coco = GrpcClientPool::new(config.coco_as_grpc)
             .await
             .context("composite: failed to initialise the CoCo AS appraiser")?;
+
+        // Pin the CoCo side per TEE, to whatever Intel TA negotiates for that
+        // TEE. This must not be a single blanket algorithm: Intel TA requires
+        // sha512 for TDX but sha256 for SGX and Azure TDX vTPM, so a blanket
+        // pin would silently guarantee a nonce mismatch on every non-TDX TEE.
+        coco.set_hash_algorithm_selector(ita_hash_algorithm);
+        info!("composite: CoCo AS runtime data hash algorithm now follows Intel TA, per TEE");
 
         let ita = IntelTrustAuthority::new(config.intel_ta)
             .await
@@ -120,12 +157,10 @@ impl Composite {
             coco,
             ita,
             return_token: config.return_token,
+            appraiser_timeout: Duration::from_secs(config.appraiser_timeout_secs),
         })
     }
 }
-
-/// The algorithm `IntelTrustAuthority::generate_challenge` requires for TDX.
-const ITA_TDX_HASH_ALGORITHM: &str = "sha512";
 
 #[async_trait]
 impl Attest for Composite {
@@ -139,9 +174,18 @@ impl Attest for Composite {
         // Appraise concurrently. Both calls are network round trips and they
         // are independent, so there is no reason to serialise them.
         let (coco_result, ita_result) = tokio::join!(
-            self.coco.verify(evidence_to_verify.clone()),
-            self.ita.verify(evidence_to_verify),
+            timeout(
+                self.appraiser_timeout,
+                self.coco.verify(evidence_to_verify.clone())
+            ),
+            timeout(self.appraiser_timeout, self.ita.verify(evidence_to_verify)),
         );
+
+        let secs = self.appraiser_timeout.as_secs();
+        let coco_result =
+            coco_result.unwrap_or_else(|_| Err(anyhow!("CoCo AS did not answer within {secs}s")));
+        let ita_result =
+            ita_result.unwrap_or_else(|_| Err(anyhow!("Intel TA did not answer within {secs}s")));
 
         // Report every failure, not just the first, so a rejection does not
         // have to be diagnosed one appraiser at a time.
@@ -295,6 +339,56 @@ mod tests {
             "https://api.trustauthority.intel.com"
         );
         assert_eq!(composite.coco_as_grpc.runtime_data_hash_algorithm, None);
+    }
+
+    /// Regression test for the defect this design is most exposed to: pinning
+    /// the CoCo AS side to one blanket algorithm. Intel TA requires sha512 for
+    /// TDX but sha256 for SGX and Azure TDX vTPM, so a blanket sha512 pin would
+    /// guarantee a nonce mismatch — and therefore a 100% attestation failure —
+    /// on every non-TDX TEE.
+    #[test]
+    fn hash_algorithm_is_selected_per_tee_not_blanket() {
+        assert_eq!(ita_hash_algorithm(Tee::Tdx).as_deref(), Some("sha512"));
+        assert_eq!(ita_hash_algorithm(Tee::Sgx).as_deref(), Some("sha256"));
+        assert_eq!(
+            ita_hash_algorithm(Tee::AzTdxVtpm).as_deref(),
+            Some("sha256")
+        );
+
+        // Not a single value across TEEs — that is the whole point.
+        assert_ne!(ita_hash_algorithm(Tee::Tdx), ita_hash_algorithm(Tee::Sgx));
+    }
+
+    /// TEEs Intel TA does not model yield no pin, leaving the CoCo AS on its
+    /// own default. The composite fails those handshakes at Intel TA anyway.
+    #[test]
+    fn unmodelled_tees_get_no_pin() {
+        assert_eq!(ita_hash_algorithm(Tee::Snp), None);
+        assert_eq!(ita_hash_algorithm(Tee::Sample), None);
+    }
+
+    /// The selector must agree with what the ITA challenge actually tells the
+    /// guest. Both read the same function, so this asserts they stay wired to
+    /// it rather than drifting into two copies of the same table.
+    #[test]
+    fn selector_matches_the_algorithm_ita_negotiates() {
+        for tee in [Tee::Tdx, Tee::Sgx, Tee::AzTdxVtpm] {
+            let negotiated = negotiated_hash_algorithm(tee)
+                .expect("Intel TA models this TEE")
+                .as_ref()
+                .to_lowercase();
+            assert_eq!(ita_hash_algorithm(tee), Some(negotiated));
+        }
+    }
+
+    #[test]
+    fn appraiser_timeout_has_a_bounded_default() {
+        // Unbounded waits would let one stalled appraiser block every request.
+        assert_eq!(
+            CompositeConfig::default().appraiser_timeout_secs,
+            DEFAULT_APPRAISER_TIMEOUT_SECS
+        );
+        assert!(DEFAULT_APPRAISER_TIMEOUT_SECS > 0);
     }
 
     #[test]
