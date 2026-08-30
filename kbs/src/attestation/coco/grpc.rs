@@ -112,11 +112,21 @@ impl GrpcClientPool {
         })
     }
 
-    /// Resolve the algorithm for one evidence entry: a per-TEE selector wins,
-    /// then an explicit operator override, then the historical default.
-    fn hash_algorithm_for(&self, tee: Tee) -> String {
-        if let Some(selector) = self.hash_algorithm_selector {
-            if let Some(algorithm) = selector(tee) {
+    /// Resolve the algorithm to digest `runtime_data` with.
+    ///
+    /// The selector and the operator override are keyed on the **primary** TEE,
+    /// not on the TEE of the entry being hashed. A handshake negotiates exactly
+    /// one algorithm — chosen from the primary TEE at challenge time — and the
+    /// guest digests `runtime_data` with that one algorithm for every evidence
+    /// set it produces, additional evidence included. Resolving per entry would
+    /// hand additional evidence (NVIDIA devices, say) a different algorithm
+    /// than the guest actually used, and every such attestation would fail on
+    /// report-data mismatch.
+    ///
+    /// The final fallback stays per entry, preserving the historical default.
+    fn hash_algorithm_for(&self, primary_tee: Option<Tee>, tee: Tee) -> String {
+        if let (Some(selector), Some(primary)) = (self.hash_algorithm_selector, primary_tee) {
+            if let Some(algorithm) = selector(primary) {
                 return algorithm;
             }
         }
@@ -158,6 +168,10 @@ impl Attest for GrpcClientPool {
     async fn verify(&self, evidence_to_verify: Vec<IndependentEvidence>) -> Result<String> {
         let mut verification_requests: Vec<IndividualAttestationRequest> = vec![];
 
+        // The primary evidence is pushed first by the RCAR handler, and its TEE
+        // is what drove the challenge's algorithm negotiation.
+        let primary_tee = evidence_to_verify.first().map(|evidence| evidence.tee);
+
         for evidence in evidence_to_verify {
             let tee = serde_json::to_string(&evidence.tee)
                 .context("CoCo AS client: serialize tee type failed.")?
@@ -165,7 +179,7 @@ impl Attest for GrpcClientPool {
                 .trim_start_matches('"')
                 .to_string();
 
-            let runtime_data_hash_algorithm = self.hash_algorithm_for(evidence.tee);
+            let runtime_data_hash_algorithm = self.hash_algorithm_for(primary_tee, evidence.tee);
 
             let mut request = IndividualAttestationRequest {
                 tee,
