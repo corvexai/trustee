@@ -211,6 +211,7 @@ mod tests {
                     crate::attestation::coco::grpc::GrpcConfig {
                         as_addr: "http://127.0.0.1:50001".into(),
                         pool_size: 100,
+                        runtime_data_hash_algorithm: None,
                     },
                 ),
             timeout: 600,
@@ -240,7 +241,7 @@ mod tests {
         }),
         PluginsConfig::ResourceStorage(RepositoryConfig::KvStorage)],
     })]
-    #[case("test_data/configs/coco-as-builtin-1.toml",         KbsConfig {
+    #[cfg_attr(feature = "coco-as-builtin", case("test_data/configs/coco-as-builtin-1.toml",         KbsConfig {
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
             insecure_key: false,
@@ -288,7 +289,7 @@ mod tests {
         },
         session_storage_type: None,
         plugins: Vec::new(),
-    })]
+    }))]
     #[case("test_data/configs/intel-ta-1.toml",         KbsConfig {
         attestation_token: AttestationTokenVerifierConfig {
             trusted_jwk_sets: vec!["/etc/ca".into(), "/etc/ca2".into()],
@@ -346,6 +347,7 @@ mod tests {
                     crate::attestation::coco::grpc::GrpcConfig {
                         as_addr: "http://as:50004".into(),
                         pool_size: crate::attestation::coco::grpc::DEFAULT_POOL_SIZE,
+                        runtime_data_hash_algorithm: None,
                     },
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
@@ -372,7 +374,7 @@ mod tests {
         session_storage_type: Some(KeyValueStorageType::Memory),
         plugins: Vec::new(),
     })]
-    #[case("test_data/configs/coco-as-builtin-2.toml",         KbsConfig {
+    #[cfg_attr(feature = "coco-as-builtin", case("test_data/configs/coco-as-builtin-2.toml",         KbsConfig {
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
             insecure_key: false,
@@ -414,7 +416,7 @@ mod tests {
         },
         session_storage_type: Some(KeyValueStorageType::Memory),
         plugins: Vec::new(),
-    })]
+    }))]
     #[case("test_data/configs/intel-ta-2.toml",         KbsConfig {
         attestation_token: AttestationTokenVerifierConfig {
             trusted_jwk_sets: vec!["https://portal.trustauthority.intel.com".into()],
@@ -460,6 +462,7 @@ mod tests {
                     crate::attestation::coco::grpc::GrpcConfig {
                         as_addr: "http://127.0.0.1:50004".into(),
                         pool_size: 100,
+                        runtime_data_hash_algorithm: None,
                     },
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
@@ -503,7 +506,7 @@ mod tests {
         session_storage_type: None,
         plugins: Vec::new(),
     })]
-    #[case("test_data/configs/coco-as-builtin-3.toml",         KbsConfig {
+    #[cfg_attr(feature = "coco-as-builtin", case("test_data/configs/coco-as-builtin-3.toml",         KbsConfig {
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
             insecure_key: false,
@@ -545,7 +548,7 @@ mod tests {
         plugins: vec![
             PluginsConfig::ResourceStorage(RepositoryConfig::KvStorage),
         ],
-    })]
+    }))]
     fn read_config(#[case] config_path: &str, #[case] expected: KbsConfig) {
         let config = KbsConfig::try_from(Path::new(config_path)).unwrap();
         assert_eq!(config, expected, "case {config_path}");

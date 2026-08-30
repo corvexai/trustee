@@ -8,6 +8,9 @@ pub mod coco;
 #[cfg(feature = "intel-trust-authority-as")]
 pub mod intel_trust_authority;
 
+#[cfg(feature = "composite-as")]
+pub mod composite;
+
 pub mod backend;
 pub mod config;
 pub mod session;

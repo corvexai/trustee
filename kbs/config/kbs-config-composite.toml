@@ -1,0 +1,50 @@
+# Composite attestation: appraise one evidence set with both the CoCo AS
+# (which covers CPU, GPUs and NVSwitches via the NRAS verifier) and Intel
+# Trust Authority (which covers CPU and HOPPER/BLACKWELL GPUs, and discards
+# NVSwitch evidence). A resource is released only when BOTH affirm.
+#
+# The GPUs are therefore appraised twice by independent parties, and the
+# NVSwitches remain covered by the CoCo AS side.
+
+[http_server]
+insecure_http = true
+
+[admin]
+authorization_mode = "InsecureAllowAll"
+
+# Trust the CoCo AS token signer. Add the ITA portal here as well if
+# `return_token` is set to "ita".
+[attestation_token]
+trusted_jwk_sets = ["https://portal.trustauthority.intel.com"]
+
+[attestation_service]
+type = "composite"
+
+# Which signed verdict is handed to the guest and therefore becomes the Rego
+# `input` for the resource policy. Both appraisers must affirm either way.
+#   "coco" (default) - the EAR token; existing resource policies keep working
+#   "ita"            - the Intel-signed token; policies must be rewritten,
+#                      because its claim shape is not EAR
+return_token = "coco"
+
+[attestation_service.coco_as_grpc]
+as_addr = "http://127.0.0.1:50004"
+# Left unset on purpose: the composite backend pins this to sha512 so it
+# matches the algorithm Intel TA negotiates with the guest for TDX. Set it
+# only if you know why you are overriding that.
+# runtime_data_hash_algorithm = "sha512"
+
+[attestation_service.intel_ta]
+base_url = "https://api.trustauthority.intel.com"
+api_key = "tBfd5kKX2x9ahbodKV1..."
+certs_file = "https://portal.trustauthority.intel.com"
+
+[storage_backend]
+storage_type = "LocalFs"
+
+[storage_backend.backends.local_fs]
+dir_path = "/opt/confidential-containers/storage"
+
+[[plugins]]
+name = "resource"
+storage_backend_type = "kvstorage"

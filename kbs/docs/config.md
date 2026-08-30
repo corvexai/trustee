@@ -71,6 +71,7 @@ Concrete attestation service can be set via `type` field. Supported attestation 
 - `coco_as_builtin`: CoCo AS that built inside KBS binary
 - `coco_as_grpc`: CoCo AS service running remotely
 - `intel_ta`: Intel&reg; Trust Authority
+- `composite`: CoCo AS and Intel&reg; Trust Authority together; both must affirm
 
 Due to different `type` field, properties are different.
 
@@ -173,6 +174,45 @@ The following properties can be set.
 | `allow_unmatched_policy` | Boolean      | Whether policy matching is required. If no `policy_ids` are specified, policy matching is not checked. | No       | false   |
 
 Detailed [documentation](https://docs.trustauthority.intel.com).
+
+#### Composite
+
+When `type` is set to `composite`, KBS appraises each evidence set with **both**
+the remote gRPC CoCo AS and Intel Trust Authority, and releases a resource only
+if both affirm. A failure from either appraiser aborts the RCAR handshake, so no
+token is issued and nothing is released.
+
+The motivation is device coverage. On an NVIDIA fabric neither appraiser sees
+everything: Intel TA discards NVSwitch evidence (it accepts only `HOPPER` and
+`BLACKWELL` architectures), while the CoCo AS appraises the whole fabric but
+signs its verdict with a locally held key. Running both gives full coverage and
+appraises the GPUs twice over, independently.
+
+> The composite backend is available only when the `composite-as` feature is
+> enabled. It implies both `coco-as-grpc` and `intel-trust-authority-as`.
+
+| Property        | Type   | Description                                                                                  | Required | Default  |
+|-----------------|--------|----------------------------------------------------------------------------------------------|----------|----------|
+| `coco_as_grpc`  | Table  | Configuration for the CoCo AS appraiser; same properties as the `coco_as_grpc` type.         | Yes      | -        |
+| `intel_ta`      | Table  | Configuration for the Intel TA appraiser; same properties as the `intel_ta` type.            | Yes      | -        |
+| `return_token`  | String | Which signed verdict is returned to the guest: `coco` or `ita`.                               | No       | `coco`   |
+
+`return_token` selects only which token travels onward, and therefore which
+claims the resource policy receives as its Rego `input`. Both appraisers must
+affirm regardless. The default `coco` returns the EAR token, so resource
+policies written against EAR submodules keep working unchanged; `ita` returns
+the Intel-signed token, which is portable but has a different claim shape and
+requires the resource policy to be rewritten.
+
+**Hash algorithm negotiation.** Both appraisers must digest `runtime_data` with
+the same algorithm, because the guest bakes that choice into its evidence at
+collection time and the digest becomes the expected nonce. Intel TA negotiates
+explicitly (sha512 for TDX) and the CoCo AS path historically hardcoded sha384,
+so the composite backend delegates challenge generation to Intel TA and pins the
+CoCo AS side to sha512 via `coco_as_grpc.runtime_data_hash_algorithm`. Leave
+that property unset unless you have a specific reason to override it.
+
+See `config/kbs-config-composite.toml` for a complete example.
 
 ### Admin API Configuration
 

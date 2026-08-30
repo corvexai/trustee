@@ -45,6 +45,12 @@ pub enum AttestationServiceConfig {
     #[cfg(feature = "intel-trust-authority-as")]
     #[serde(alias = "intel_ta")]
     IntelTA(super::intel_trust_authority::IntelTrustAuthorityConfig),
+
+    /// Appraise with the CoCo AS and Intel TA together; release only if both
+    /// affirm. See [`super::composite`].
+    #[cfg(feature = "composite-as")]
+    #[serde(alias = "composite")]
+    Composite(super::composite::CompositeConfig),
 }
 
 impl Default for AttestationServiceConfig {

@@ -38,6 +38,21 @@ pub struct GrpcConfig {
     pub as_addr: String,
     #[serde(default = "default_pool_size")]
     pub pool_size: u64,
+
+    /// Override the hash algorithm used to digest `runtime_data` into the
+    /// expected report data.
+    ///
+    /// Leave unset for the historical behaviour (sha512 for SE, sha384
+    /// otherwise). It exists because the algorithm is negotiated with the
+    /// guest at challenge time and baked into the evidence: when another
+    /// appraiser drives that negotiation — see the composite backend, where
+    /// Intel TA requires sha512 for TDX — this side must digest with the same
+    /// algorithm or every nonce comparison fails.
+    ///
+    /// The value is passed through to the AS, which is the authority on which
+    /// algorithms exist.
+    #[serde(default)]
+    pub runtime_data_hash_algorithm: Option<String>,
 }
 
 fn default_as_addr() -> String {
@@ -53,12 +68,14 @@ impl Default for GrpcConfig {
         Self {
             as_addr: DEFAULT_AS_ADDR.to_string(),
             pool_size: DEFAULT_POOL_SIZE,
+            runtime_data_hash_algorithm: None,
         }
     }
 }
 
 pub struct GrpcClientPool {
     pool: Pool<GrpcManager>,
+    runtime_data_hash_algorithm: Option<String>,
 }
 
 impl GrpcClientPool {
@@ -72,7 +89,18 @@ impl GrpcClientPool {
         };
         let pool = Pool::builder().max_open(config.pool_size).build(manager);
 
-        Ok(Self { pool })
+        let runtime_data_hash_algorithm = config
+            .runtime_data_hash_algorithm
+            .map(|algorithm| algorithm.to_lowercase());
+
+        if let Some(algorithm) = &runtime_data_hash_algorithm {
+            info!("CoCo AS client: runtime data hash algorithm pinned to {algorithm}");
+        }
+
+        Ok(Self {
+            pool,
+            runtime_data_hash_algorithm,
+        })
     }
 }
 
@@ -104,9 +132,12 @@ impl Attest for GrpcClientPool {
                 .trim_start_matches('"')
                 .to_string();
 
-            let runtime_data_hash_algorithm = match evidence.tee {
-                Tee::Se => HashAlgorithm::Sha512.as_ref().to_string().to_lowercase(),
-                _ => HashAlgorithm::Sha384.as_ref().to_string().to_lowercase(),
+            let runtime_data_hash_algorithm = match &self.runtime_data_hash_algorithm {
+                Some(algorithm) => algorithm.clone(),
+                None => match evidence.tee {
+                    Tee::Se => HashAlgorithm::Sha512.as_ref().to_string().to_lowercase(),
+                    _ => HashAlgorithm::Sha384.as_ref().to_string().to_lowercase(),
+                },
             };
 
             let mut request = IndividualAttestationRequest {

@@ -51,6 +51,7 @@ static VERSION_REQ: LazyLock<VersionReq> = LazyLock::new(|| {
 pub type TeeEvidence = serde_json::Value;
 
 /// IndependentEvidence is one set of evidence from one attester.
+#[derive(Clone)]
 pub struct IndependentEvidence {
     pub tee: Tee,
     pub tee_evidence: TeeEvidence,
@@ -170,6 +171,13 @@ impl AttestationService {
                     .await
                     .map_err(|e| Error::AttestationServiceInitialization { source: e })?;
                 Arc::new(intel_ta) as _
+            }
+            #[cfg(feature = "composite-as")]
+            AttestationServiceConfig::Composite(cfg) => {
+                let composite = super::composite::Composite::new(cfg)
+                    .await
+                    .map_err(|e| Error::AttestationServiceInitialization { source: e })?;
+                Arc::new(composite) as _
             }
         };
 

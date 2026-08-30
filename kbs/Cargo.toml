@@ -27,6 +27,11 @@ coco-as-grpc = ["coco-as", "mobc", "tonic", "tonic-prost", "prost"]
 # Use Intel TA as backend attestation service
 intel-trust-authority-as = ["as", "az-cvm-vtpm"]
 
+# Appraise with both the remote gRPC CoCo-AS and Intel TA, releasing only when
+# both affirm. Gives full fabric coverage (the CoCo AS side appraises the
+# NVSwitches that Intel TA discards) with the GPUs appraised twice over.
+composite-as = ["coco-as-grpc", "intel-trust-authority-as"]
+
 # Support external gRPC plugins
 external-plugin = ["tonic", "tonic-prost", "prost", "backon", "rustls"]
 
