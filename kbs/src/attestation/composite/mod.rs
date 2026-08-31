@@ -41,8 +41,9 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use kbs_types::{Challenge, Tee};
 use serde::Deserialize;
 use tokio::time::timeout;
@@ -86,6 +87,19 @@ pub struct CompositeConfig {
     #[serde(default)]
     pub return_token: ReturnToken,
 
+    /// Intel TA `attester_tcb_status` values that count as an affirmation.
+    ///
+    /// Intel TA returns HTTP 200 with a signed token even when the platform TCB
+    /// is out of date — the verdict lives in the claims, not the status code.
+    /// Upstream's ITA client discards those claims, so without this check
+    /// "Intel TA affirmed" would mean no more than "Intel TA answered".
+    ///
+    /// Defaults to `["OK"]`, which is fail-closed. A platform carrying known
+    /// Intel advisories reports `OutOfDate`; accepting it is a deliberate
+    /// decision an operator must write down here, not a silent default.
+    #[serde(default = "default_accepted_tcb_status")]
+    pub ita_accepted_tcb_status: Vec<String>,
+
     /// Seconds to wait for each appraiser before giving up.
     ///
     /// Both appraisers are remote, and neither client sets a timeout of its
@@ -100,6 +114,10 @@ pub struct CompositeConfig {
 /// premature timeout would present as an attestation failure.
 pub const DEFAULT_APPRAISER_TIMEOUT_SECS: u64 = 180;
 
+fn default_accepted_tcb_status() -> Vec<String> {
+    vec!["OK".to_string()]
+}
+
 fn default_appraiser_timeout_secs() -> u64 {
     DEFAULT_APPRAISER_TIMEOUT_SECS
 }
@@ -110,6 +128,7 @@ impl Default for CompositeConfig {
             coco_as_grpc: GrpcConfig::default(),
             intel_ta: IntelTrustAuthorityConfig::default(),
             return_token: ReturnToken::default(),
+            ita_accepted_tcb_status: default_accepted_tcb_status(),
             appraiser_timeout_secs: DEFAULT_APPRAISER_TIMEOUT_SECS,
         }
     }
@@ -127,7 +146,58 @@ pub struct Composite {
     coco: GrpcClientPool,
     ita: IntelTrustAuthority,
     return_token: ReturnToken,
+    accepted_tcb_status: Vec<String>,
     appraiser_timeout: Duration,
+}
+
+/// The TCB verdict Intel TA reported, and the advisories behind it.
+struct ItaVerdict {
+    tcb_status: Option<String>,
+    advisory_ids: Vec<String>,
+}
+
+/// Read the verdict out of an Intel TA token.
+///
+/// The signature is already checked by `IntelTrustAuthority::verify` before this
+/// runs, so decoding the payload here is reading a verified document, not
+/// trusting an unverified one.
+fn read_ita_verdict(token: &str) -> anyhow::Result<ItaVerdict> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| anyhow!("Intel TA token is not a JWT"))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("Intel TA token payload is not base64url")?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&bytes).context("Intel TA token payload is not JSON")?;
+
+    // The verdict is nested under the attester type.
+    for tee in ["tdx", "sgx"] {
+        let Some(block) = claims.get(tee) else {
+            continue;
+        };
+        return Ok(ItaVerdict {
+            tcb_status: block
+                .get("attester_tcb_status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            advisory_ids: block
+                .get("attester_advisory_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+    }
+
+    Ok(ItaVerdict {
+        tcb_status: None,
+        advisory_ids: Vec::new(),
+    })
 }
 
 impl Composite {
@@ -157,6 +227,7 @@ impl Composite {
             coco,
             ita,
             return_token: config.return_token,
+            accepted_tcb_status: config.ita_accepted_tcb_status,
             appraiser_timeout: Duration::from_secs(config.appraiser_timeout_secs),
         })
     }
@@ -211,10 +282,41 @@ impl Attest for Composite {
         let coco_token = coco_result.expect("checked above");
         let ita_token = ita_result.expect("checked above");
 
+        // A 200 from Intel TA is not an affirmation. The verdict is in the
+        // claims, and upstream's client throws them away, so check them here.
+        let verdict = read_ita_verdict(&ita_token)
+            .context("composite: could not read the Intel TA verdict")?;
+
+        match &verdict.tcb_status {
+            Some(status) if self.accepted_tcb_status.iter().any(|a| a == status) => {}
+            Some(status) => {
+                warn!(
+                    "composite: Intel TA reports attester_tcb_status={status}, advisories={:?}",
+                    verdict.advisory_ids
+                );
+                bail!(
+                    "composite attestation failed — Intel TA returned a token but reports \
+                     attester_tcb_status={status}, which is not in the accepted list {:?}. \
+                     Advisories: {:?}. Add the status to ita_accepted_tcb_status only as a \
+                     deliberate, recorded decision.",
+                    self.accepted_tcb_status,
+                    verdict.advisory_ids
+                );
+            }
+            None => {
+                bail!(
+                    "composite attestation failed — the Intel TA token carries no \
+                     attester_tcb_status, so its verdict cannot be established"
+                );
+            }
+        }
+
         info!(
-            "composite: both appraisers affirmed (CoCo AS token {} bytes, Intel TA token {} bytes)",
+            "composite: both appraisers affirmed (CoCo AS token {} bytes, Intel TA token {} bytes, \
+             Intel TA tcb_status={:?})",
             coco_token.len(),
-            ita_token.len()
+            ita_token.len(),
+            verdict.tcb_status
         );
 
         match self.return_token {
@@ -379,6 +481,127 @@ mod tests {
                 .to_lowercase();
             assert_eq!(ita_hash_algorithm(tee), Some(negotiated));
         }
+    }
+
+    /// What the two appraisers actually digest, and why it is not the same bytes.
+    ///
+    /// Intel TA's client hashes serde_json's `Display` output
+    /// (`runtime_data.to_string()` in `intel_trust_authority::build_attest_request`).
+    /// The CoCo AS never sees that string: the gRPC client sends it, the AS
+    /// re-parses it and hashes **JCS-canonical** bytes
+    /// (`attestation-service/src/lib.rs`, `parse_runtime_data`).
+    ///
+    /// A review flagged this as an unenforced invariant, on the premise that the
+    /// two encodings agree because nothing enables serde_json's `preserve_order`.
+    /// **That premise is false.** `josekit` enables `preserve_order` in this
+    /// build, so `Value` maps are insertion-ordered and `to_string()` does *not*
+    /// emit JCS key order. This test pins that reality so nobody re-derives the
+    /// wrong conclusion from the review.
+    ///
+    /// The system nevertheless works, because Intel TA parses the runtime data
+    /// and canonicalises it server-side rather than hashing our bytes verbatim —
+    /// observed directly in a captured token, whose `attester_runtime_data` claim
+    /// comes back with sorted keys and whose `tdx_report_data` matched.
+    ///
+    /// The place that is *not* covered by that reasoning is the GPU nonce, which
+    /// `build_attest_request` computes **locally** as
+    /// `sha512(runtime_data.to_string())[..32]`. If the guest derives its GPU
+    /// nonce from the canonical digest, the two differ. See
+    /// `docs/DR-002-overlapping-hybrid.md` — that is an open question, not a
+    /// settled one.
+    #[test]
+    fn the_two_serialisations_are_known_to_differ() {
+        use kbs_types::TeePubKey;
+        use serde_json::json;
+
+        let tee_pubkey = TeePubKey::RSA {
+            alg: "RSA1_5".into(),
+            k_mod: "sGYs1c7B_3_ZUxr0RvjEwLpXqRnPjm3Ck0hfLxLm".into(),
+            k_exp: "AQAB".into(),
+        };
+
+        // The exact shape kbs::attestation::backend builds.
+        let runtime_data = json!({
+            "tee-pubkey": tee_pubkey,
+            "nonce": "cmFuZG9tLW5vbmNlLXZhbHVlLTMyLWJ5dGVzLWxvbmc=",
+        });
+
+        let ita_bytes = runtime_data.to_string().into_bytes();
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&runtime_data.to_string()).expect("re-parse");
+        let coco_bytes = serde_json_canonicalizer::to_vec(&reparsed).expect("canonicalize");
+
+        // Both must remain valid JSON describing the same object...
+        let a: serde_json::Value = serde_json::from_slice(&ita_bytes).unwrap();
+        let b: serde_json::Value = serde_json::from_slice(&coco_bytes).unwrap();
+        assert_eq!(
+            a, b,
+            "the two encodings must at least describe the same value"
+        );
+
+        // ...but they are NOT the same bytes, because preserve_order is on.
+        assert_ne!(
+            ita_bytes, coco_bytes,
+            "The two encodings now agree byte-for-byte. That is a real change: \
+             either preserve_order was disabled or runtime_data's shape changed. \
+             Re-read the GPU-nonce reasoning in docs/DR-002-overlapping-hybrid.md \
+             before assuming this is harmless."
+        );
+    }
+
+    /// A 200 from Intel TA is not an affirmation — the verdict is in the claims.
+    /// These are the shapes a real captured token produced.
+    #[test]
+    fn ita_verdict_is_read_from_the_token_claims() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use serde_json::json;
+
+        let make = |claims: serde_json::Value| {
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(claims.to_string())
+            )
+        };
+
+        // Shape observed live from GPU22 on 2026-08-31.
+        let out_of_date = make(json!({
+            "tdx": {
+                "attester_tcb_status": "OutOfDate",
+                "attester_advisory_ids": ["INTEL-SA-01314", "INTEL-SA-01397"],
+            }
+        }));
+        let v = read_ita_verdict(&out_of_date).expect("verdict");
+        assert_eq!(v.tcb_status.as_deref(), Some("OutOfDate"));
+        assert_eq!(v.advisory_ids.len(), 2);
+
+        let ok = make(json!({ "tdx": { "attester_tcb_status": "OK" } }));
+        let v = read_ita_verdict(&ok).expect("verdict");
+        assert_eq!(v.tcb_status.as_deref(), Some("OK"));
+        assert!(v.advisory_ids.is_empty());
+
+        // SGX nests it under its own key.
+        let sgx = make(json!({ "sgx": { "attester_tcb_status": "OK" } }));
+        assert_eq!(
+            read_ita_verdict(&sgx)
+                .expect("verdict")
+                .tcb_status
+                .as_deref(),
+            Some("OK")
+        );
+
+        // No verdict at all must be distinguishable from an affirming one.
+        let empty = make(json!({}));
+        assert_eq!(read_ita_verdict(&empty).expect("verdict").tcb_status, None);
+    }
+
+    /// The default must be fail-closed. GPU22 itself reports OutOfDate, so a
+    /// permissive default would have silently accepted a platform carrying six
+    /// Intel advisories.
+    #[test]
+    fn accepted_tcb_status_defaults_to_ok_only() {
+        let accepted = CompositeConfig::default().ita_accepted_tcb_status;
+        assert_eq!(accepted, vec!["OK".to_string()]);
+        assert!(!accepted.iter().any(|s| s == "OutOfDate"));
     }
 
     #[test]

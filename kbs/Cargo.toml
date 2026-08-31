@@ -125,6 +125,10 @@ attestation-service = { path = "../attestation-service", default-features = fals
 
 
 [dev-dependencies]
+# Used only to pin the cross-serializer invariant the composite backend depends
+# on: the AS digests JCS-canonical bytes while Intel TA digests
+# serde_json's Display output. See attestation::composite::tests.
+serde_json_canonicalizer = "0.3"
 josekit = "0.10.3"
 tempfile.workspace = true
 rstest.workspace = true
