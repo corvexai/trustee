@@ -1,0 +1,6 @@
+# Upstream's own placeholder API key, carried in its Intel TA example config and
+# copied into ours. Not a credential — gitleaks flags it on entropy alone.
+# The current tip uses an unmistakable placeholder instead; these fingerprints
+# cover the commit where the upstream string was still present.
+0e110da54a6bf2c2491748d3010d3d0c5b578b39:kbs/config/kbs-config-composite.toml:generic-api-key:39
+cd18c85:kbs/config/kbs-config-composite.toml:generic-api-key:45

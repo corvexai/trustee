@@ -42,7 +42,7 @@ as_addr = "http://127.0.0.1:50004"
 
 [attestation_service.intel_ta]
 base_url = "https://api.trustauthority.intel.com"
-api_key = "tBfd5kKX2x9ahbodKV1..."
+api_key = "REPLACE_WITH_YOUR_ITA_API_KEY"
 certs_file = "https://portal.trustauthority.intel.com"
 
 [storage_backend]
